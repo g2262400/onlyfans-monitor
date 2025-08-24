@@ -1,11 +1,11 @@
-# Playwright with Python + Chromium already bundled
+# Playwright base image (includes Chromium and system deps)
 FROM mcr.microsoft.com/playwright/python:v1.54.0-jammy
 
 WORKDIR /app
 COPY monitor.py /app/monitor.py
 
-# Install Python dependencies (requests only, playwright is already included in base image)
-RUN pip install --no-cache-dir requests
+# Install Python bindings + requests
+RUN pip install --no-cache-dir playwright requests
 
-# Koyeb will run this script
+# Run the script
 CMD ["python", "monitor.py"]
