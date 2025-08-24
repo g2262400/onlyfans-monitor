@@ -7,8 +7,11 @@ WORKDIR /app
 # Copy your Python script into the container
 COPY monitor.py /app/monitor.py
 
-# Install Python dependencies
-RUN pip install requests
+# Install dependencies (playwright + requests)
+RUN pip install --no-cache-dir playwright requests
 
-# Run the script when the container starts
+# Make sure browsers are installed (Playwright needs this step)
+RUN playwright install --with-deps chromium
+
+# Run the script
 CMD ["python", "monitor.py"]
