@@ -5,7 +5,7 @@ import requests
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
 from datetime import datetime, timezone
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 TARGET_URL = os.getenv("TARGET_URL", "https://onlyfans.com/horvthnorbert15")
 CHECK_PATTERNS = ["available now", "seen seconds ago"]
@@ -57,41 +57,111 @@ def page_inner_text(page):
 def monitor():
     available = False
     start_ts = None
+
     send_discord_message(
         f"Monitoring started for {urlparse(TARGET_URL).netloc}\nURL: {TARGET_URL}\nTime: {datetime.now(timezone.utc).astimezone().isoformat(timespec='seconds')}"
     )
 
     with sync_playwright() as p:
-        args = ["--no-sandbox", "--disable-dev-shm-usage"]
+        args = [
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--disable-web-security",
+            "--disable-blink-features=AutomationControlled",
+            "--disable-features=IsolateOrigins,site-per-process",
+        ]
         log("launching chromium")
         browser = p.chromium.launch(headless=True, args=args)
 
-        context = browser.new_context(locale="en-US")
+        # Realistic desktop fingerprint
+        context = browser.new_context(
+            locale="en-US",
+            timezone_id="UTC",
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1366, "height": 768},
+        )
+        context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            Object.defineProperty(navigator, 'languages', {get: () => ['en-US','en']});
+            Object.defineProperty(navigator, 'platform', {get: () => 'Win32'});
+        """)
+
         page = context.new_page()
 
-        page.route("**/*", lambda route: route.abort() if route.request.resource_type in ("image","media","font") else route.continue_())
+        # Block heavy assets
+        def route_handler(route):
+            rt = route.request.resource_type
+            if rt in ("image", "media", "font"):
+                return route.abort()
+            return route.continue_()
+        page.route("**/*", route_handler)
 
+        # Robust navigation with retries
         log(f"opening {TARGET_URL}")
-        try:
-            page.goto(TARGET_URL, wait_until="networkidle", timeout=45000)
-        except Exception as e:
-            log(f"navigation warn: {e}")
+        nav_ok = False
+        for attempt in range(1, 4):
+            try:
+                page.goto(TARGET_URL, wait_until="networkidle", timeout=45000)
+                nav_ok = True
+                break
+            except PWTimeout as e:
+                log(f"navigation timeout attempt {attempt}: {e}")
+            except Exception as e:
+                log(f"navigation error attempt {attempt}: {e}")
+            time.sleep(2)
             try:
                 page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=30000)
+                nav_ok = True
+                break
             except Exception as e2:
-                log(f"navigation fail: {e2}")
+                log(f"fallback nav error attempt {attempt}: {e2}")
+                time.sleep(2)
+
+        if not nav_ok:
+            log("failed to navigate after retries, exiting")
+            try:
+                context.close(); browser.close()
+            except Exception:
+                pass
+            return
+
+        # Quick snapshot to verify content
+        try:
+            html = page.content()
+            log(f"page url: {page.url}")
+            log(f"html length: {len(html)}")
+            log(f"html head: {html[:200].replace(chr(10),' ')}")
+            txt = page_inner_text(page)
+            log(f"innerText length: {len(txt)}")
+            log(f"innerText head: {txt[:200].replace(chr(10),' ')}")
+        except Exception as e:
+            log(f"snapshot error: {e}")
 
         log("watching live DOM")
 
         try:
             while True:
+                # keep JS alive
                 try:
                     page.evaluate("() => void 0")
                 except Exception:
                     pass
 
                 txt = page_inner_text(page).lower()
-                present = any(pat in txt for pat in CHECK_PATTERNS)
+                # also fallback to html if needed
+                if not txt:
+                    try:
+                        html = page.content().lower()
+                    except Exception:
+                        html = ""
+                else:
+                    html = ""
+
+                present = any(pat in txt for pat in CHECK_PATTERNS) or any(pat in html for pat in CHECK_PATTERNS)
 
                 if present and not available:
                     available = True
@@ -118,13 +188,12 @@ def monitor():
                 time.sleep(CHECK_INTERVAL_SECONDS)
         finally:
             try:
-                context.close()
-                browser.close()
+                context.close(); browser.close()
             except Exception:
                 pass
 
 if __name__ == "__main__":
-    if os.getenv("PORT"):  # only start HTTP server on Koyeb
+    if os.getenv("PORT"):
         threading.Thread(target=start_http, daemon=True).start()
     threading.Thread(target=heartbeat, daemon=True).start()
     monitor()
